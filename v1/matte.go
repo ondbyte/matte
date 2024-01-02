@@ -3,18 +3,14 @@ package matte
 import (
 	"fmt"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
-	"github.com/go-openapi/spec"
-	"github.com/ondbyte/matte/frameworks"
-	"github.com/ondbyte/matte/swaggo"
 	"github.com/rogpeppe/go-internal/modfile"
-	"github.com/swaggo/swag"
 )
 
 type Pkg struct {
@@ -24,14 +20,16 @@ type Pkg struct {
 }
 
 type Matte struct {
-	matteDir      string
-	swagger       *spec.Swagger
-	fileSet       *token.FileSet
-	wd            string
-	allFrameworks frameworks.Frameworks
-	corePkg       *Pkg
-	Pkgs          []*Pkg
-	modFile       *modfile.File
+	matteDir string
+	fileSet  *token.FileSet
+	wd       string
+	corePkg  *Pkg
+	// refers the pkg which is being processed
+	currentPkg *Pkg
+	Pkgs       []*Pkg
+	modFile    *modfile.File
+	src        string
+	imports    string
 }
 
 const MatteDir = "matte"
@@ -56,72 +54,59 @@ func createMatteDir(projectDir string) (string, error) {
 	return dir, nil
 }
 
-func NewMatte(fileSet *token.FileSet, allFrameworks frameworks.Frameworks) (*Matte, error) {
-	projectDir, err := os.Getwd()
+// builds the project at path 'project'
+func Build(fileSet *token.FileSet, project string) error {
+	matteDir, err := createMatteDir(project)
 	if err != nil {
-		return nil, fmt.Errorf("unable get working dir due to err: %v", err)
+		return fmt.Errorf("unable to make matteDir due to err: %v", err)
 	}
-	matteDir, err := createMatteDir(projectDir)
-	if err != nil {
-		return nil, fmt.Errorf("unable to make matteDir due to err: %v", err)
+	m := &Matte{
+		fileSet:  fileSet,
+		wd:       project,
+		matteDir: matteDir,
 	}
-	return &Matte{
-		fileSet:       fileSet,
-		wd:            projectDir,
-		allFrameworks: allFrameworks,
-		matteDir:      matteDir,
-	}, nil
-}
-
-// loads the project to matte's ast tree
-// no test files will be included
-func (m *Matte) LoadProject() (first error) {
-	err := m.parseModFile()
+	// defer clean up
+	//defer m.DeferCleanUp()
+	err = m.parseModFile()
 	if err != nil {
 		return err
 	}
-	flags := parser.AllErrors | parser.ParseComments
-	m.Pkgs = []*Pkg{}
-	pkg, dirs, err := m.parseDir("./", flags)
+	err = m.loadProject()
 	if err != nil {
 		return err
 	}
-	m.corePkg = pkg
-	m.Pkgs = append(m.Pkgs, pkg)
-	for {
-		nextRoundDir := []string{}
-		for _, d := range dirs {
-			pkg, newDirs, err := m.parseDir(d, flags)
-			if err != nil {
-				return err
-			}
-			m.Pkgs = append(m.Pkgs, pkg)
-			nextRoundDir = append(nextRoundDir, newDirs...)
-		}
-		if len(nextRoundDir) == 0 {
-			break
-		}
-		dirs = nextRoundDir
-
+	err = m.processProject()
+	if err != nil {
+		return err
 	}
-	return
+	err = m.build()
+	return err
 }
 
-func (m *Matte) importPathForDirectory(dir string) string {
-	if dir == "./" {
-		return m.modFile.Module.Mod.Path
-	}
-	return filepath.Join(m.modFile.Module.Mod.Path, dir)
-}
+func (m *Matte) build() error {
+	srcS := fmt.Sprintf(`
+	package main
 
-func (m *Matte) ProcessProject() error {
-	for _, pkg := range m.Pkgs {
-		for _, file := range pkg.Files {
-			err := m.processFile(file, pkg.ImportPath, pkg.Name)
-			if err != nil {
-				return err
-			}
-		}
+	import (
+		"encoding/json"
+		"fmt"
+		"net/http"
+	
+		"github.com/julienschmidt/httprouter"
+		%v
+	)
+	func main(){
+		router := httprouter.New()
+		%v
+	}
+	`, m.imports, m.src)
+	_, err := format.Source([]byte(srcS))
+	if err != nil {
+		//return fmt.Errorf("failed to format go src due to err: %v", err)
+	}
+	err = os.WriteFile(filepath.Join(m.matteDir, "app.go"), []byte(srcS), 0777)
+	if err != nil {
+		return fmt.Errorf("failed to write file app.go due to err: %v", err)
 	}
 	return nil
 }
@@ -143,6 +128,54 @@ func (m *Matte) parseModFile() error {
 		return fmt.Errorf("unable to parse mod file data, file is at %v", goModFilePath)
 	}
 	m.modFile = modFile
+	return nil
+}
+
+func (m *Matte) loadProject() (first error) {
+	flags := parser.AllErrors | parser.ParseComments
+	m.Pkgs = []*Pkg{}
+	pkg, dirs, err := m.parseDir(m.wd, flags)
+	if err != nil {
+		return err
+	}
+	m.corePkg = pkg
+	m.Pkgs = append(m.Pkgs, pkg)
+	for {
+		nextRoundDir := []string{}
+		for _, d := range dirs {
+			pkg, newDirs, err := m.parseDir(d, flags)
+			if err != nil {
+				return err
+			}
+			m.Pkgs = append(m.Pkgs, pkg)
+			nextRoundDir = append(nextRoundDir, newDirs...)
+		}
+		if len(nextRoundDir) == 0 {
+			break
+		}
+		dirs = nextRoundDir
+	}
+	return
+}
+
+func (m *Matte) importPathForDirectory(dir string) string {
+	if dir == "./" {
+		return m.modFile.Module.Mod.Path
+	}
+	return filepath.Join(m.modFile.Module.Mod.Path, dir)
+}
+
+func (m *Matte) processProject() error {
+	for _, pkg := range m.Pkgs {
+		m.currentPkg = pkg
+		m.imports += fmt.Sprintf(`"%v"`, pkg.ImportPath) + "\n"
+		for _, file := range pkg.Files {
+			err := m.processFile(file)
+			if err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -192,26 +225,13 @@ func (m *Matte) parseDir(dirPath string, mode parser.Mode) (pkg *Pkg, dirs []str
 
 // processes a ast.File and finds each REST handler specific to the passed framework(ex:gin) and
 // parses the swag comments, based on these comments mounts the handler in the framework automatically so you dont have to manually
-func (m *Matte) processFile(astFile *ast.File, pkgImportPathOfAstFile, pkgNameOfAstFile string) error {
+func (m *Matte) processFile(astFile *ast.File) (err error) {
 	for _, fnDecl := range astFile.Decls {
 		// iterate over all the functions in the package but not methods
+
 		if fnDecl, ok := fnDecl.(*ast.FuncDecl); ok && fnDecl.Recv == nil {
-			framework := m.allFrameworks.GetFrameworkForHandler(fnDecl.Type)
-			if framework == nil {
-				continue
-			}
-			if fnDecl.Doc == nil {
-				return fmt.Errorf("handler %v does not have any comment, unable to parse swag spec for it", fnDecl.Name.Name)
-			}
-			operation := swag.NewOperation(nil)
-			for _, c := range fnDecl.Doc.List {
-				err := swaggo.ParseComment(operation, c.Text, astFile, "")
-				if err != nil {
-					return err
-				}
-			}
-			for _, rp := range operation.RouterProperties {
-				err := framework.AddHandler(rp.HTTPMethod, rp.Path, pkgImportPathOfAstFile, pkgNameOfAstFile, fnDecl.Name.Name)
+			if fnDecl.Doc != nil {
+				err := m.ProcessFn(fnDecl)
 				if err != nil {
 					return err
 				}
@@ -222,90 +242,82 @@ func (m *Matte) processFile(astFile *ast.File, pkgImportPathOfAstFile, pkgNameOf
 	return nil
 }
 
-// parses Matte function
-func (m *Matte) ParseGeneralAPIInfo() error {
-	generalApiInfoContainingFile := ""
-	for _, file := range m.corePkg.Files {
-		for _, decl := range file.Decls {
-			if decl, ok := decl.(*ast.FuncDecl); ok && decl.Name.Name == GeneralApiInfoFuncName {
-				generalApiInfoContainingFile = m.fileSet.Position(file.Package).Filename
-			}
-		}
-	}
-	if generalApiInfoContainingFile == "" {
-		return fmt.Errorf("unable to find function name '%v', which is required to parse your applications core configurations like port it runs", GeneralApiInfoFuncName)
-	}
-	swaggoParser := swag.New()
-	err := swaggoParser.ParseGeneralAPIInfo(generalApiInfoContainingFile)
-	if err != nil {
-		return fmt.Errorf("error while calling ParseGeneralAPIInfo : %v", err)
-	}
-	m.swagger = swaggoParser.GetSwagger()
-	if m.swagger == nil {
-		return fmt.Errorf("m.swagger should not be nil")
-	}
-	return nil
-}
-
-// finalizes the apps source code
-// and writes to a matte.go file
-func (m *Matte) Finalize() error {
-	imports := []string{}
-	funcNames := []string{}
-	body := ""
-	for _, v := range m.allFrameworks {
-		importStmt, funcName, funcSrc, err := v.Finalize()
-		if err != nil {
-			return fmt.Errorf("unable to Finalize because err: %v", err)
-		}
-		imports = append(imports, importStmt)
-		funcNames = append(funcNames, funcName)
-		body += funcSrc + "\n"
-	}
-	src := "package main\n"
-	for _, v := range imports {
-		src += v + "\n"
-	}
-	src += "\n" + body + "\n\n"
-	src += "func main(){\n"
-	for _, v := range funcNames {
-		src += "go " + v + "()\n"
-	}
-	src += "}\n"
-	filePath, err := filepath.Abs(filepath.Join(m.matteDir, "app.go"))
-	if err != nil {
-		return fmt.Errorf("failed to get absolute path from path because err:%v", err)
-	}
-	file, err := os.Create(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to create file %v because err: %v", filePath, err)
-	}
-	_, err = file.WriteString(src)
-	if err != nil {
-		return fmt.Errorf("failed to write to file %v because err: %v", filePath, err)
-	}
-	return nil
-}
-
-// builds the finalized main program written to matte.go using go build
-func (m *Matte) Build() error {
-	err := os.Chdir(m.matteDir)
-	if err != nil {
-		return fmt.Errorf("error while changing directory to matte dir %v, err: %v", m.matteDir, err)
-	}
-	defer os.Chdir(m.wd)
-	build := exec.Command("go", "build")
-	stdErr := &strings.Builder{}
-	build.Stderr = stdErr
-	err = build.Run()
-	stdErrStr := stdErr.String()
-	if err != nil {
-		return fmt.Errorf("error running 'go build' command due to err: %w and stdErr: %v", err, stdErrStr)
-	}
-	return nil
-}
-
-//
 func (m *Matte) DeferCleanUp() error {
 	return os.RemoveAll(m.matteDir)
+}
+
+type Decorator struct {
+	name string
+	args []string
+}
+
+func ParseDecorator(s string) (decorator *Decorator, err error) {
+	expr, err := parser.ParseExpr(s)
+	if err != nil {
+		return nil, err
+	}
+	expr2, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return nil, fmt.Errorf("invalid decorator")
+	}
+	nameIdent, ok := expr2.Fun.(*ast.Ident)
+	if !ok {
+		return nil, fmt.Errorf("invalid decorator: name doesnt match any available decorator")
+	}
+	decorator = &Decorator{name: nameIdent.Name, args: []string{}}
+	for _, arg := range expr2.Args {
+		lit, ok := arg.(*ast.BasicLit)
+		if !ok {
+			return nil, fmt.Errorf("invalid decorator: arg %v is not basic lit", arg)
+		}
+		decorator.args = append(decorator.args, lit.Value)
+	}
+	return decorator, nil
+}
+
+func ParseComment(com *ast.CommentGroup) (decorators map[string]*Decorator, err error) {
+	decorators = map[string]*Decorator{}
+	for _, c := range com.List {
+		splitLine := strings.Split(c.Text, "@")
+		if len(splitLine) == 1 {
+			// not a comment which we should process
+			return
+		}
+		// ignore the first element
+		splitLine = splitLine[1:]
+
+		for _, possibleDecoratorText := range splitLine {
+			var decorator *Decorator
+			decorator, err = ParseDecorator(possibleDecoratorText)
+			if err != nil {
+				return
+			}
+			decorators[decorator.name] = decorator
+		}
+	}
+	return
+}
+
+func (m *Matte) ProcessFn(fnDecl *ast.FuncDecl) (err error) {
+	decorators := map[string]*Decorator{}
+	if fnDecl.Doc != nil {
+		decorators, err = ParseComment(fnDecl.Doc)
+		if err != nil {
+			return
+		}
+		if len(decorators) == 0 {
+			// not a handler
+			return
+		}
+		pathDecorator := decorators["path"]
+		if pathDecorator == nil {
+			err = fmt.Errorf("a 'path' decorator is required")
+			return
+		}
+		err := m.ProcessPath(pathDecorator, fnDecl)
+		if err != nil {
+			return err
+		}
+	}
+	return
 }

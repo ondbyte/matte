@@ -7,7 +7,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/ondbyte/matte/frameworks"
 	m "github.com/ondbyte/matte/v1"
 	flag "github.com/ondbyte/turbo_flag"
 )
@@ -71,7 +70,7 @@ func buildCmd(cmd flag.CMD, args []string) {
 	if err != nil {
 		panic(fmt.Errorf("unable change working dir to %v", workingDir))
 	}
-	matte, err = m.NewMatte(fileset, frameworks.Frameworks{
+	matte, err = m.Build(fileset, frameworks.Frameworks{
 		frameworks.NewHttp(),
 	})
 	if err != nil {
